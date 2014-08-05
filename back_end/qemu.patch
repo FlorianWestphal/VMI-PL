@@ -1,0 +1,215 @@
+diff --git a/net/dump.c b/net/dump.c
+index 9d3a09e..0583239 100644
+--- a/net/dump.c
++++ b/net/dump.c
+@@ -29,11 +29,25 @@
+ #include "qemu/timer.h"
+ #include "hub.h"
+ 
++#define VMI_PL
++
++#ifdef VMI_PL
++#define VMI_PL_MSG_E_NET	7
++#define VMI_PL_MSG_VM_END	65535
++
++#include <asm/types.h>
++#include <sys/socket.h>
++#include <linux/netlink.h>
++#endif //VMI_PL
++
+ typedef struct DumpState {
+     NetClientState nc;
+     int64_t start_ts;
+     int fd;
+     int pcap_caplen;
++    #ifdef VMI_PL
++    int pipe;
++    #endif //VMI_PL
+ } DumpState;
+ 
+ #define PCAP_MAGIC 0xa1b2c3d4
+@@ -57,6 +71,25 @@ struct pcap_sf_pkthdr {
+     uint32_t len;
+ };
+ 
++#ifdef VMI_PL
++static void vmipl_send(int pipe, void* data, size_t size) {
++
++	void *message;
++	long *msg;
++	
++	message = calloc(sizeof(long) + size, sizeof(void));
++	msg = (long*) message;
++	*msg = size;
++	msg += 1;
++	
++	memcpy((void*) msg, (void*) data, size);
++
++	write(pipe, message, sizeof(long) + size);
++	free(message);
++	
++}
++#endif //VMI_PL
++
+ static ssize_t dump_receive(NetClientState *nc, const uint8_t *buf, size_t size)
+ {
+     DumpState *s = DO_UPCAST(DumpState, nc, nc);
+@@ -65,7 +98,11 @@ static ssize_t dump_receive(NetClientState *nc, const uint8_t *buf, size_t size)
+     int caplen;
+ 
+     /* Early return in case of previous error. */
++    #ifdef VMI_PL
++    if (s->fd < 0 && s->pipe < 0) {
++    #else
+     if (s->fd < 0) {
++    #endif
+         return size;
+     }
+ 
+@@ -76,6 +113,13 @@ static ssize_t dump_receive(NetClientState *nc, const uint8_t *buf, size_t size)
+     hdr.ts.tv_usec = ts % 1000000;
+     hdr.caplen = caplen;
+     hdr.len = size;
++    
++    #ifdef VMI_PL
++    if (s->pipe > -1) {
++    	vmipl_send(s->pipe, (void*) &hdr, sizeof(hdr));
++    	vmipl_send(s->pipe, (void*) buf, caplen);
++    } else
++    #endif
+     if (write(s->fd, &hdr, sizeof(hdr)) != sizeof(hdr) ||
+         write(s->fd, buf, caplen) != caplen) {
+         qemu_log("-net dump write error - stop dump\n");
+@@ -90,7 +134,17 @@ static void dump_cleanup(NetClientState *nc)
+ {
+     DumpState *s = DO_UPCAST(DumpState, nc, nc);
+ 
++	#ifdef VMI_PL
++	if (s->pipe > -1) {
++		int termination_msg = VMI_PL_MSG_VM_END;
++		vmipl_send(s->pipe, (void*) &termination_msg, sizeof(int));
++		close(s->pipe);
++	} else {
++		close(s->fd);
++	}
++	#else
+     close(s->fd);
++    #endif
+ }
+ 
+ static NetClientInfo net_dump_info = {
+@@ -100,8 +154,14 @@ static NetClientInfo net_dump_info = {
+     .cleanup = dump_cleanup,
+ };
+ 
++#ifdef VMI_PL
++static int net_dump_init(NetClientState *peer, const char *device,
++                         const char *name, const char *filename, int len,
++                         const char *pipename, const char createpipe)
++#else
+ static int net_dump_init(NetClientState *peer, const char *device,
+                          const char *name, const char *filename, int len)
++#endif
+ {
+     struct pcap_file_hdr hdr;
+     NetClientState *nc;
+@@ -109,11 +169,23 @@ static int net_dump_init(NetClientState *peer, const char *device,
+     struct tm tm;
+     int fd;
+ 
++	#ifdef VMI_PL
++	int pipe = -1;
++	if (createpipe) {
++		pipe = open(pipename, O_WRONLY);
++		if (pipe < 0) {
++			return -1;
++		}
++	} else {
++	#endif //VMI_PL
+     fd = open(filename, O_CREAT | O_TRUNC | O_WRONLY | O_BINARY, 0644);
+     if (fd < 0) {
+         error_report("-net dump: can't open %s", filename);
+         return -1;
+     }
++    #ifdef VMI_PL
++    }
++    #endif //VMI_PL
+ 
+     hdr.magic = PCAP_MAGIC;
+     hdr.version_major = 2;
+@@ -123,6 +195,11 @@ static int net_dump_init(NetClientState *peer, const char *device,
+     hdr.snaplen = len;
+     hdr.linktype = 1;
+ 
++	#ifdef VMI_PL
++	if (pipe > -1) {
++		vmipl_send(pipe, (void*) &hdr, sizeof(hdr));
++	} else
++	#endif //VMI_PL
+     if (write(fd, &hdr, sizeof(hdr)) < sizeof(hdr)) {
+         error_report("-net dump write error: %s", strerror(errno));
+         close(fd);
+@@ -131,13 +208,26 @@ static int net_dump_init(NetClientState *peer, const char *device,
+ 
+     nc = qemu_new_net_client(&net_dump_info, peer, device, name);
+ 
++	#ifdef VMI_PL
++	if (pipe > -1) {
++		snprintf(nc->info_str, sizeof(nc->info_str),
++             "dump to %s", pipename);
++	} else {
++		snprintf(nc->info_str, sizeof(nc->info_str),
++             "dump to %s (len=%d)", filename, len);
++	}
++	#else
+     snprintf(nc->info_str, sizeof(nc->info_str),
+              "dump to %s (len=%d)", filename, len);
++	#endif //VMI_PL
+ 
+     s = DO_UPCAST(DumpState, nc, nc);
+ 
+     s->fd = fd;
+     s->pcap_caplen = len;
++    #ifdef VMI_PL
++    s->pipe = pipe;
++    #endif //VMI_PL
+ 
+     qemu_get_timedate(&tm, 0);
+     s->start_ts = mktime(&tm);
+@@ -152,6 +242,10 @@ int net_init_dump(const NetClientOptions *opts, const char *name,
+     const char *file;
+     char def_file[128];
+     const NetdevDumpOptions *dump;
++    #ifdef VMI_PL
++    char createpipe = 0;
++    char *pipename;
++    #endif // VMI_PL
+ 
+     assert(opts->kind == NET_CLIENT_OPTIONS_KIND_DUMP);
+     dump = opts->dump;
+@@ -160,7 +254,14 @@ int net_init_dump(const NetClientOptions *opts, const char *name,
+ 
+     if (dump->has_file) {
+         file = dump->file;
+-    } else {
++    } 
++    #ifdef VMI_PL
++    else if (dump->has_pipe_name) {
++    	pipename = dump->pipe_name;
++    	createpipe = 1;
++    }
++    #endif// VMI_PL
++    else {
+         int id;
+         int ret;
+ 
+@@ -181,5 +282,9 @@ int net_init_dump(const NetClientOptions *opts, const char *name,
+         len = 65536;
+     }
+ 
++	#ifdef VMI_PL
++	return net_dump_init(peer, "dump", name, file, len, pipename, createpipe);
++	#else
+     return net_dump_init(peer, "dump", name, file, len);
++    #endif
+ }

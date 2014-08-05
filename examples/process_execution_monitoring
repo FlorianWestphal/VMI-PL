@@ -1,0 +1,9 @@
+Configuration{
+	SyscallDispatcherAddress: 0xc15780e8
+	SyscallNumberLocation: EAX
+	SyscallInterruptNumber: 128
+}
+Syscall{
+	ReadRegister(EAX, #test)
+	ReadRegister(CR3, #test)
+}

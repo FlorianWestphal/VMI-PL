@@ -1,0 +1,1451 @@
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index ca645a0..08906f6 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -37,6 +37,11 @@
+ #define KVM_MMIO_SIZE 8
+ #endif
+ 
++#define VMI_PL
++#ifdef VMI_PL
++#include "vmi_pl.h"
++#endif //VMI_PL
++
+ /*
+  * The bit 16 ~ bit 31 of kvm_memory_region::flags are internally used
+  * in kvm, other bits are visible for userspace which are defined in
+@@ -272,6 +277,9 @@ struct kvm_vcpu {
+ #endif
+ 	bool preempted;
+ 	struct kvm_vcpu_arch arch;
++	#ifdef VMI_PL
++	struct vmipl_probe_struct probe;
++	#endif //VMI_PL
+ };
+ 
+ static inline int kvm_vcpu_exiting_guest_mode(struct kvm_vcpu *vcpu)
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index c6c8bbe..88260df 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -64,6 +64,8 @@
+ MODULE_AUTHOR("Qumranet");
+ MODULE_LICENSE("GPL");
+ 
++#define VMI_PL
++
+ /*
+  * Ordering of locks:
+  *
+@@ -1536,6 +1538,9 @@ int kvm_write_guest(struct kvm *kvm, gpa_t gpa, const void *data,
+ 	}
+ 	return 0;
+ }
++#ifdef VMI_PL
++EXPORT_SYMBOL_GPL(kvm_write_guest);
++#endif	//VMI_PL
+ 
+ int kvm_gfn_to_hva_cache_init(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 			      gpa_t gpa, unsigned long len)
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 45fd70c..ea0aeb0 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -46,6 +46,20 @@
+ 
+ #include "trace.h"
+ 
++#define VMI_PL
++
++#ifdef VMI_PL
++#include <net/sock.h>
++#include <linux/netlink.h>
++
++#include "vmi_pl.h"
++
++struct vmipl_probe_struct vmipl_default;
++struct vmipl_event_struct *vmipl_current_event = NULL;
++struct sock *vmipl_nl_sk = NULL;
++struct vmipl_vcpu_list *vmipl_vcpu_list = NULL;
++#endif	//VMI_PL
++
+ #define __ex(x) __kvm_handle_fault_on_reboot(x)
+ #define __ex_clear(x, reg) \
+ 	____kvm_handle_fault_on_reboot(x, "xor " reg " , " reg)
+@@ -4711,6 +4725,9 @@ static int handle_exception(struct kvm_vcpu *vcpu)
+ 	unsigned long cr2, rip, dr6;
+ 	u32 vect_info;
+ 	enum emulation_result er;
++	#ifdef VMI_PL
++	unsigned long ip;
++	#endif	//VMI_PL
+ 
+ 	vect_info = vmx->idt_vectoring_info;
+ 	intr_info = vmx->exit_intr_info;
+@@ -4727,7 +4744,22 @@ static int handle_exception(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	if (is_invalid_opcode(intr_info)) {
++	#ifdef VMI_PL
++		if (vcpu->probe.active_event_probes & VMI_PL_SYSCALL) {
++			ip = kvm_rip_read(vcpu);
++			if (ip == vcpu->probe.os_settings.syscall_dispatch_address) {
++				vmipl_handle_syscall(vcpu, vmipl_read_selected_register(vcpu, vcpu->probe.os_settings.syscall_nr_location));
++				vmipl_emulate_instructions(vcpu);
++				er = EMULATE_DONE;
++			} else {
++				er = emulate_instruction(vcpu, EMULTYPE_TRAP_UD);
++			}
++		} else {
++			er = emulate_instruction(vcpu, EMULTYPE_TRAP_UD);
++		}
++	#else
+ 		er = emulate_instruction(vcpu, EMULTYPE_TRAP_UD);
++	#endif	//VMI_PL
+ 		if (er != EMULATE_DONE)
+ 			kvm_queue_exception(vcpu, UD_VECTOR);
+ 		return 1;
+@@ -4771,6 +4803,11 @@ static int handle_exception(struct kvm_vcpu *vcpu)
+ 	switch (ex_no) {
+ 	case DB_VECTOR:
+ 		dr6 = vmcs_readl(EXIT_QUALIFICATION);
++		#ifdef VMI_PL
++		if (vcpu->probe.active_event_probes & VMI_PL_AT_ADDRESS) {
++			vmipl_handle_db(vcpu, dr6);
++		}
++		#endif	//VMI_PL
+ 		if (!(vcpu->guest_debug &
+ 		      (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP))) {
+ 			vcpu->arch.dr6 = dr6 | DR6_FIXED_1;
+@@ -4933,14 +4970,29 @@ static int handle_cr(struct kvm_vcpu *vcpu)
+ 		case 0:
+ 			err = handle_set_cr0(vcpu, val);
+ 			kvm_complete_insn_gp(vcpu, err);
++			#ifdef VMI_PL
++			if (vcpu->probe.active_event_probes & VMI_PL_CR_WRITE) {
++				vmipl_handle_cr_write(vcpu, cr);
++			}
++			#endif	//VMI_PL
+ 			return 1;
+ 		case 3:
+ 			err = kvm_set_cr3(vcpu, val);
+ 			kvm_complete_insn_gp(vcpu, err);
++			#ifdef VMI_PL
++			if (vcpu->probe.active_event_probes & VMI_PL_CR_WRITE) {
++				vmipl_handle_cr_write(vcpu, cr);
++			}
++			#endif	//VMI_PL
+ 			return 1;
+ 		case 4:
+ 			err = handle_set_cr4(vcpu, val);
+ 			kvm_complete_insn_gp(vcpu, err);
++			#ifdef VMI_PL
++			if (vcpu->probe.active_event_probes & VMI_PL_CR_WRITE) {
++				vmipl_handle_cr_write(vcpu, cr);
++			}
++			#endif	//VMI_PL
+ 			return 1;
+ 		case 8: {
+ 				u8 cr8_prev = kvm_get_cr8(vcpu);
+@@ -4998,6 +5050,11 @@ static int handle_dr(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned long exit_qualification;
+ 	int dr, reg;
++	#ifdef VMI_PL
++	struct vmipl_at_event_struct *at_event;
++	unsigned long address;
++	u8 undefined_instruction[] = {0x0f, 0x0b};
++	#endif // VMI_PL
+ 
+ 	/* Do not handle if the CPL > 0, will trigger GP on re-entry */
+ 	if (!kvm_require_cpl(vcpu, 0))
+@@ -5034,8 +5091,32 @@ static int handle_dr(struct kvm_vcpu *vcpu)
+ 		unsigned long val;
+ 		if (!kvm_get_dr(vcpu, dr, &val))
+ 			kvm_register_write(vcpu, reg, val);
+-	} else
++	} else {
++		#ifdef VMI_PL
++		address = vcpu->arch.regs[reg];
++		if (vcpu->probe.active_event_probes & VMI_PL_AT_ADDRESS) {
++			at_event = (struct vmipl_at_event_struct*) vmipl_get_tree_element(vcpu->probe.event_root, VMI_PL_AT_ADDRESS);
++			while (at_event != NULL) {
++				if (at_event->dbg_register == dr) {
++					address = at_event->address;
++					break;
++				}
++				if (dr == VMI_PL_DBG_7) {
++					vmipl_set_dr7(at_event, &address);
++				}
++				at_event = (struct vmipl_at_event_struct*) at_event->event_probe_definitions.next;
++			}
++		} 
++		kvm_set_dr(vcpu, dr, address);
++		/* manipulation for intercepting syscalls - when Linux sets the debug registers 
++			to zero there should be no process running yet and all system calls afterwards can be intercepted */
++		if (vcpu->probe.active_event_probes & VMI_PL_SYSCALL && dr == VMI_PL_DBG_7) {
++			vmipl_write_to_address(vcpu, vcpu->probe.os_settings.syscall_dispatch_address, (void*) &undefined_instruction, sizeof(undefined_instruction));
++		}
++		#else
+ 		kvm_set_dr(vcpu, dr, vcpu->arch.regs[reg]);
++		#endif	//VMI_PL
++	}
+ 	skip_emulated_instruction(vcpu);
+ 	return 1;
+ }
+@@ -6677,6 +6758,14 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu)
+ 		}
+ 	}
+ 
++	#ifdef VMI_PL
++	if (vcpu->probe.active_event_probes & VMI_PL_EXTERNAL_REQUEST) {
++		if (vcpu->probe.received_requests > 0) {
++			vmipl_handle_on_external_request(vcpu);
++		}
++	}
++	#endif	//VMI_PL
++
+ 	if (exit_reason < kvm_vmx_max_exit_handlers
+ 	    && kvm_vmx_exit_handlers[exit_reason])
+ 		return kvm_vmx_exit_handlers[exit_reason](vcpu);
+@@ -7016,6 +7105,11 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 	debugctlmsr = get_debugctlmsr();
+ 
+ 	vmx->__launched = vmx->loaded_vmcs->launched;
++	#ifdef VMI_PL
++	if (vmx->__launched && vcpu->probe.active_event_probes & VMI_PL_ON_RESUME) {
++		vmipl_handle_on_resume(vcpu);
++	}
++	#endif	//VMI_PL
+ 	asm(
+ 		/* Store host registers */
+ 		"push %%" _ASM_DX "; push %%" _ASM_BP ";"
+@@ -7162,6 +7256,25 @@ static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 
++	#ifdef VMI_PL
++	struct vmipl_connect_info connect_info;
++	
++	if (vmipl_vcpu_list_remove(&vmipl_vcpu_list, vcpu)) {
++		if (vcpu->probe.nl_socket != NULL) {
++			connect_info.nl_socket = vcpu->probe.nl_socket;
++			vmipl_prepare_sending(&connect_info, 0);
++			vmipl_send(&connect_info, 1, VMI_PL_MSG_VM_END);
++			sk_release_kernel(vcpu->probe.nl_socket);
++		}
++			
++		if (vcpu->probe.event_root != NULL) {
++			printk("vmx_free_vcpu: remove probe definitions\n");
++			vmipl_free_event_tree(vcpu->probe.event_root);
++		}
++	}
++	
++	#endif	//VMI_PL
++
+ 	free_vpid(vmx);
+ 	free_nested(vmx);
+ 	free_loaded_vmcs(vmx->loaded_vmcs);
+@@ -7229,6 +7342,18 @@ static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
+ 	vmx->nested.current_vmptr = -1ull;
+ 	vmx->nested.current_vmcs12 = NULL;
+ 
++	#ifdef VMI_PL
++	if (vmipl_default.active_event_probes) {
++		printk("Initialize vcpu probe configuration.\n");
++		memcpy((void*) &(vmx->vcpu.probe), (void*) &vmipl_default, sizeof(struct vmipl_probe_struct));
++		printk("vcpu active probes: 0x%08x\n", vmx->vcpu.probe.active_event_probes);
++		
++		vmipl_default.active_event_probes = 0;
++		vmipl_default.event_root = NULL;
++		vmipl_vcpu_list_add(&vmipl_vcpu_list, &(vmx->vcpu), vmx->vcpu.probe.channel_nr);
++	}
++	#endif	//VMI_PL
++
+ 	return &vmx->vcpu;
+ 
+ free_vmcs:
+@@ -8270,6 +8395,19 @@ static int __init vmx_init(void)
+ {
+ 	int r, i, msr;
+ 
++	#ifdef VMI_PL
++	/* create netlink socket to wait for configuration information from user space */
++	vmipl_nl_sk = netlink_kernel_create(&init_net, VMI_PL_CHANNEL, 1, vmipl_data_ready, NULL, THIS_MODULE);
++	if (!vmipl_nl_sk) {
++		printk("Failed to create netlink socket for protocol: %d\n", VMI_PL_CHANNEL);
++		return -ENOMEM;
++	} else {
++		vmipl_default.active_event_probes = 0;
++		vmipl_default.event_root = NULL;
++		printk("Netlink socket for protocol %d sucessfully created.\n", VMI_PL_CHANNEL);
++	}
++	#endif	//VMI_PL
++
+ 	rdmsrl_safe(MSR_EFER, &host_efer);
+ 
+ 	for (i = 0; i < NR_VMX_MSR; ++i)
+@@ -8407,6 +8545,12 @@ out:
+ 
+ static void __exit vmx_exit(void)
+ {
++
++	#ifdef VMI_PL
++	if(vmipl_nl_sk != NULL)	
++		sk_release_kernel(vmipl_nl_sk);
++	#endif	//VMI_PL
++
+ 	free_page((unsigned long)vmx_msr_bitmap_legacy_x2apic);
+ 	free_page((unsigned long)vmx_msr_bitmap_longmode_x2apic);
+ 	free_page((unsigned long)vmx_msr_bitmap_legacy);
+@@ -8424,5 +8568,1150 @@ static void __exit vmx_exit(void)
+ 	kvm_exit();
+ }
+ 
++#ifdef VMI_PL
++/* netlink message handler */
++void vmipl_data_ready(struct sk_buff *skb){
++	struct nlmsghdr *nlh = (struct nlmsghdr *)skb->data; 
++	int pid = 0;
++	struct sk_buff *skb_out = NULL;
++	
++	char result = 0;
++	unsigned char msg_type;
++	unsigned char *msg;
++	__u32 probe_type;
++	__u32 *probe_pointer;
++//	int i;
++	pid = nlh->nlmsg_pid; 
++	msg = (unsigned char*) nlmsg_data(nlh);
++	msg_type = nlh->nlmsg_type;
++	printk("Message received from user space with message type: %d\n", msg_type);
++	
++	/* get probe type */
++	if (msg_type != VMI_PL_MSG_PROBES) {
++		probe_pointer = (__u32*) msg;
++		probe_type = probe_pointer[0];
++		probe_pointer += 1;
++		msg = (unsigned char*) probe_pointer;
++	}
++	
++	/* process message */
++	switch(msg_type) {
++		case VMI_PL_MSG_PROBES:
++			if (vmipl_default.event_root != NULL) {
++				if(vmipl_default.nl_socket != NULL) {
++					sk_release_kernel(vmipl_default.nl_socket);
++				}
++				vmipl_free_event_tree(vmipl_default.event_root);
++			}
++			memcpy((void*)&vmipl_default, (void*)msg, sizeof(struct vmipl_probe_struct));
++			printk("active event probes: 0x%08x\n", vmipl_default.active_event_probes);	
++			printk("proc address: 0x%08x\n", vmipl_default.os_settings.proc_list_address);
++/*			for (i = 0; i < sizeof(struct vmipl_probe_struct) / 8; i += 1) {
++				printk("0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", msg[0], msg[1], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7]);
++				msg += 8;
++			}*/
++			vmipl_default.nl_socket = netlink_kernel_create(&init_net, vmipl_default.channel_nr, 1, vmipl_vcpu_netlink_handler, NULL, THIS_MODULE);
++			if (!vmipl_default.nl_socket) {
++				printk("Failed to create netlink socket for protocol: %d\n", vmipl_default.channel_nr);
++			} else {
++				printk("Netlink socket for protocol %d sucessfully created.\n", vmipl_default.channel_nr);
++			}
++			break;
++		case VMI_PL_MSG_E_EVENT:
++			vmipl_current_event = vmipl_create_event((void*)msg, sizeof(struct vmipl_event_struct), probe_type);
++			break;
++		case VMI_PL_MSG_E_EVENT_AT:
++			vmipl_current_event = vmipl_create_event((void*)msg, sizeof(struct vmipl_at_event_struct), probe_type);
++			break;
++		case VMI_PL_MSG_E_CR:
++			vmipl_current_event = vmipl_create_event((void*)msg, sizeof(struct vmipl_cr_event_struct), probe_type);
++			break;
++		case VMI_PL_MSG_E_SYSCALL:
++			vmipl_current_event = vmipl_create_event((void*)msg, sizeof(struct vmipl_syscall_struct), probe_type);
++			break;
++		case VMI_PL_MSG_E_EXT_REQ:
++			vmipl_current_event = vmipl_create_event((void*)msg, sizeof(struct vmipl_external_request_struct), probe_type);
++			break;
++		case VMI_PL_MSG_D_READ_REG:
++			vmipl_create_data_probe((void*) msg, sizeof(struct vmipl_read_reg_struct), probe_type);
++			break;
++		case VMI_PL_MSG_D_READ_MEM:
++			vmipl_create_data_probe((void*) msg, sizeof(struct vmipl_read_mem_struct), probe_type);
++			break;
++		case VMI_PL_MSG_D_READ_MEM_AT:
++			vmipl_create_data_probe((void*) msg, sizeof(struct vmipl_read_mem_at_struct), probe_type);
++			break;
++		case VMI_PL_MSG_D_PROC_LIST:
++			vmipl_create_data_probe((void*) msg, sizeof(struct vmipl_proc_list_struct), probe_type);
++			break;
++		default:
++			break;		
++	}
++	
++	/* send result back to sender */
++	if( !(skb_out = nlmsg_new(sizeof(char), 0)) ) {
++      	printk("VMI-PL: %s: Error creating new netlink message.\n.", __func__);
++		return;
++    }
++    
++    nlh = nlmsg_put(skb_out, 0, 0, NLMSG_DONE, sizeof(char), 0); 
++    NETLINK_CB(skb_out).dst_group = 0; /* not in mcast group */
++    memcpy((void*)nlmsg_data(nlh), (void*)&result, sizeof(char));
++
++	if(nlmsg_unicast(vmipl_nl_sk, skb_out, pid) < 0) {
++		printk("VMI-PL: %s: Error sending netlink message.\n.", __func__);
++	}
++}
++
++void vmipl_vcpu_netlink_handler(struct sk_buff *skb) {
++	struct nlmsghdr *nlh = (struct nlmsghdr *)skb->data;
++	unsigned int *msg;
++	struct kvm_vcpu* vcpu;
++	int request_id;
++	
++//	printk("received message with type: %d\n", nlh->nlmsg_type);
++//	vcpu = vmipl_vcpu_list_get(vmipl_vcpu_list, (unsigned char) skb->sk->sk_protocol);
++//	printk("Configuration:\n address: 0x%08x\n tasks_offset: %d\n mm_struct_offset: %d\n", vcpu->probe.os_settings.proc_list_address, vcpu->probe.os_settings.tasks_offset, vcpu->probe.os_settings.mm_struct_offset);
++	if (nlh->nlmsg_type == VMI_PL_MSG_E_EXT_REQ) {
++		msg = (unsigned int*) nlmsg_data(nlh);
++		request_id = *msg;
++		printk("got request with id: %d\n", request_id);
++		vcpu = vmipl_vcpu_list_get(vmipl_vcpu_list, (unsigned char) skb->sk->sk_protocol);
++		vcpu->probe.received_requests = vcpu->probe.received_requests | (1 << request_id);
++//		vmipl_handle_on_external_request(vcpu, request_id);
++	}
++	
++	
++}
++
++struct vmipl_event_struct* vmipl_create_event(void *msg, unsigned long size, __u32 probe_type) {
++	struct vmipl_event_struct *event;
++	event = (struct vmipl_event_struct*) kmalloc(size, GFP_KERNEL);
++	memcpy((void*)event, msg, size);
++	printk("event probe created with type: %d\n", probe_type);
++	vmipl_tree_insert(&vmipl_default.event_root, event, probe_type);
++	return event;
++}
++
++void vmipl_create_data_probe(void *msg, unsigned long size, __u32 probe_type) {
++	void *data_probe;
++	struct vmipl_data_struct *data_struct;
++	data_probe = kmalloc(size, GFP_KERNEL);
++	memcpy(data_probe, msg, size);
++	data_struct = (struct vmipl_data_struct*) data_probe;
++	printk("data probe created with type: %d and group: %d\n", probe_type, data_struct->group_id);
++	vmipl_tree_insert(&(vmipl_current_event->data_probes_root), data_probe, probe_type);
++}
++
++/* event probe handlers */
++void vmipl_handle_cr_write(struct kvm_vcpu *vcpu, int cr) {
++	struct vmipl_cr_event_struct *cr_write;
++	struct vmipl_event_struct *event_definition;
++	unsigned char pause;
++	
++	cr_write = (struct vmipl_cr_event_struct*) vmipl_get_tree_element(vcpu->probe.event_root, VMI_PL_CR_WRITE);
++	pause = 0;
++		
++	while (cr_write != NULL) {
++		event_definition = &(cr_write->event_probe_definitions);
++		if (cr_write->cr == cr) {
++			pause |= vmipl_process_filters(vcpu, event_definition);
++			vmipl_process_data_probes(vcpu, event_definition->probe_id, event_definition->active_data_probes, event_definition->data_probes_root);
++			pause |= event_definition->pause;
++		}
++		cr_write = (struct vmipl_cr_event_struct*) event_definition->next;
++	}
++	
++	if (pause) {
++		/* TODO: pause virtual machine */
++	}
++	
++}
++
++void vmipl_handle_on_resume(struct kvm_vcpu *vcpu) {
++	struct vmipl_event_struct *event;
++	unsigned char pause;
++	
++	event = (struct vmipl_event_struct*) vmipl_get_tree_element(vcpu->probe.event_root, VMI_PL_ON_RESUME);
++	pause = 0;
++		
++	while (event != NULL) {
++		pause |= vmipl_process_filters(vcpu, event);
++		vmipl_process_data_probes(vcpu, event->probe_id, event->active_data_probes, event->data_probes_root);
++		pause |= event->pause;
++		event = event->next;
++	}
++	
++	if (pause) {
++		/* TODO: pause virtual machine */
++	}
++}
++
++void vmipl_handle_db(struct kvm_vcpu *vcpu, unsigned long dr6) {
++	struct vmipl_at_event_struct *at_event;
++	struct vmipl_event_struct *event;
++	unsigned char pause;
++	unsigned char dbg_register;
++	
++	at_event = (struct vmipl_at_event_struct*) vmipl_get_tree_element(vcpu->probe.event_root, VMI_PL_AT_ADDRESS);
++	pause = 0;
++	
++//	dbg_register = dr6 & DEBUG_REG_ACCESS_NUM;
++	if (dr6 & VMI_PL_DBG_0_SET) {
++		dbg_register = VMI_PL_DBG_0;
++	} else if (dr6 & VMI_PL_DBG_1_SET) {
++		dbg_register = VMI_PL_DBG_1;
++	} else if (dr6 & VMI_PL_DBG_2_SET) {
++		dbg_register = VMI_PL_DBG_2;
++	} else if (dr6 & VMI_PL_DBG_3_SET) {
++		dbg_register = VMI_PL_DBG_3;
++	}
++		
++//	printk("handle_db: address: %08x dbg: %d condition: %d dr6: %08x type: %d\n", at_event->address, at_event->dbg_register, at_event->event_condition, dr6, at_event->event_probe_definitions.data_probes_root->type);
++	while (at_event != NULL) {
++		event = &(at_event->event_probe_definitions);
++		if (dbg_register == at_event->dbg_register) {
++			pause |= vmipl_process_filters(vcpu, event);
++			vmipl_process_data_probes(vcpu, event->probe_id, event->active_data_probes, event->data_probes_root);
++			pause |= event->pause;
++			if (at_event->event_condition == VMI_PL_EXEC) {
++				vmx_set_rflags(vcpu, vmx_get_rflags(vcpu) | X86_EFLAGS_RF);		// debug exception is not handled by guest
++			}
++		}
++		at_event = (struct vmipl_at_event_struct*) event->next;
++	}
++	if (pause) {
++		/* TODO: pause virtual machine */
++	}
++}
++
++void vmipl_handle_syscall(struct kvm_vcpu *vcpu, unsigned char syscall_nr) {
++	struct vmipl_syscall_struct *syscall;
++	struct vmipl_event_struct *event;
++	unsigned char pause;
++	
++	syscall = (struct vmipl_syscall_struct*) vmipl_get_tree_element(vcpu->probe.event_root, VMI_PL_SYSCALL);
++	pause = 0;
++
++	while (syscall != NULL) {
++		event = &(syscall->event_probe_definitions);
++		if (syscall->syscall_nr == syscall_nr || syscall->syscall_nr == 0) {
++			pause |= vmipl_process_filters(vcpu, event);
++			vmipl_process_data_probes(vcpu, event->probe_id, event->active_data_probes, event->data_probes_root);
++			pause |= event->pause;
++		}
++		syscall = (struct vmipl_syscall_struct*) event->next;
++	}
++	if (pause) {
++		/* TODO: pause virtual machine */
++	}
++}
++
++void vmipl_handle_on_external_request(struct kvm_vcpu *vcpu) {
++	struct vmipl_external_request_struct *ext_req;
++	struct vmipl_event_struct *event;
++	unsigned char pause;
++	
++	ext_req = (struct vmipl_external_request_struct*) vmipl_get_tree_element(vcpu->probe.event_root, VMI_PL_EXTERNAL_REQUEST);
++	pause = 0;
++	
++	while (ext_req != NULL) {
++		event = &(ext_req->event_probe_definitions);
++		if ((1 << ext_req->request_id) & vcpu->probe.received_requests) {
++			pause |= vmipl_process_filters(vcpu, event);
++			vmipl_process_data_probes(vcpu, event->probe_id, event->active_data_probes, event->data_probes_root);
++			pause |= event->pause;
++			vcpu->probe.received_requests = vcpu->probe.received_requests & ~(1 << ext_req->request_id); 
++		}
++		ext_req = (struct vmipl_external_request_struct*) event->next;
++	}
++	if (pause) {
++		/* TODO: pause virtual machine */
++	}
++	
++}
++
++/* data probe handlers */
++/*
++ * send data contained in specified register
++ * +----------------+-------------+------------------+
++ * | event probe ID | register ID | register content |
++ * +----------------+-------------+------------------+
++ */
++void vmipl_read_register_probe(struct kvm_vcpu *vcpu, struct vmipl_read_reg_struct *read_register, __u32 event_probe_id) {
++	struct vmipl_connect_info connect_info;
++	unsigned long size; //, i
++	unsigned long *data, *temp;
++	__u32 *iterator;
++//	__u32 counter, temp;
++	struct vmipl_segment *segment;
++	struct vmipl_dt *dt;
++	
++	connect_info.nl_socket = vcpu->probe.nl_socket;
++	size = vmipl_register_data_size(read_register->registers);
++	
++	vmipl_prepare_sending(&connect_info, size);
++	data = (unsigned long*) nlmsg_data(connect_info.nlh);
++	iterator = (__u32*) data;
++//	counter = 1;
++	/* load data... */
++/*	for (i = 0; i < VMI_PL_REGISTERS_COUNT; i += 1) {	// iterate over all possible registers
++		temp = counter & read_register->registers;
++		if (temp) {
++			if (temp & VMI_PL_REGISTERS) {
++				*iterator = vmipl_read_selected_register(vcpu, temp);	
++				iterator++;
++			} else if (temp & VMI_PL_SEGMENTS) {
++				segment = (struct vmipl_segment*) iterator;
++				vmipl_read_segment(vcpu, segment, temp);
++				segment++;
++				iterator = (unsigned long*) segment;
++			} else {
++				dt = (struct vmipl_dt*) iterator;
++				vmipl_read_dt(vcpu, dt, temp);
++				dt++;
++				iterator = (unsigned long*) dt;
++			}
++		}
++		counter = counter << 1;
++	}*/
++	*iterator = event_probe_id;
++	iterator++;
++	*iterator = read_register->registers;
++	iterator++;
++	if (read_register->registers & VMI_PL_REGISTERS) {
++		temp = (unsigned long*) iterator;
++		*temp = vmipl_read_selected_register(vcpu, read_register->registers);	
++	} else if (read_register->registers & VMI_PL_SEGMENTS) {
++		segment = (struct vmipl_segment*) iterator;
++		vmipl_read_segment(vcpu, segment, read_register->registers);
++	} else if (read_register->registers & VMI_PL_DTABLES) {
++		dt = (struct vmipl_dt*) iterator;
++		vmipl_read_dt(vcpu, dt, read_register->registers);
++	}
++	
++	vmipl_send(&connect_info, read_register->data_struct.group_id, VMI_PL_MSG_D_READ_REG);
++}
++
++/*
++ * send memory content read from specified address
++ * 
++ * +----------------+---------+----------------+
++ * | event probe ID | address | memory content |
++ * +----------------+---------+----------------+
++ */
++void vmipl_read_memory_probe(struct kvm_vcpu *vcpu, struct vmipl_read_mem_struct *read_memory, __u32 event_probe_id) {
++	struct vmipl_connect_info connect_info;
++	void *data;
++	__u32 *temp1;
++	unsigned long size, *temp2;
++	
++	//		probe_id		address					memory content
++	size = sizeof(__u32) + sizeof(unsigned long) + read_memory->size;
++	
++	connect_info.nl_socket = vcpu->probe.nl_socket;
++	vmipl_prepare_sending(&connect_info, size);
++	
++	data = (void*) nlmsg_data(connect_info.nlh);
++	
++	temp1 = (__u32*) data;
++	*temp1 = event_probe_id;
++	temp1++;
++	temp2 = (unsigned long*) temp1;
++	*temp2 = read_memory->address;
++	temp2++;
++	
++	vmipl_read_memory(vcpu, read_memory->address, (void*) temp2, read_memory->size);
++	
++	vmipl_send(&connect_info, read_memory->data_struct.group_id, VMI_PL_MSG_D_READ_MEM);
++	
++}
++
++/*
++ * send memory content read specified by given register
++ * 
++ * +----------------+-------------+----------------+
++ * | event probe id | register ID | memory content |
++ * +----------------+-------------+----------------+
++ */
++void vmipl_read_memory_at_probe(struct kvm_vcpu *vcpu, struct vmipl_read_mem_at_struct *read_memory_at, __u32 event_probe_id) {
++	struct vmipl_connect_info connect_info;
++	void *data;
++	unsigned long register_content, size;
++	__u32 *temp;
++
++	//		probe_id		register id		memory content
++	size = sizeof(__u32) + sizeof(__u32) + read_memory_at->size;
++	
++	connect_info.nl_socket = vcpu->probe.nl_socket;
++	vmipl_prepare_sending(&connect_info, size);
++	data = (void*) nlmsg_data(connect_info.nlh);
++	
++	temp = (__u32*) data;
++	*temp = event_probe_id;
++	temp++;
++	*temp = read_memory_at->selected_register;
++	temp++;
++	
++	register_content = vmipl_read_selected_register(vcpu, read_memory_at->selected_register);
++	register_content += read_memory_at->offset;
++	
++	vmipl_read_memory(vcpu, register_content, (void*) temp, read_memory_at->size);
++	
++	vmipl_send(&connect_info, read_memory_at->data_struct.group_id, VMI_PL_MSG_D_READ_MEM_AT);
++}
++
++/*
++ * send memory content read specified by given register
++ * 
++ * +----------------+--------+----------------------+
++ * | event probe id | fields | process field values |
++ * +----------------+--------+----------------------+
++ */
++void vmipl_process_list_probe(struct kvm_vcpu *vcpu, struct vmipl_proc_list_struct *process_list, __u32 event_probe_id) {
++	
++	unsigned int pid, name_size, path_length, total_size;
++	unsigned long pgd, size;
++	unsigned long curr_head, next, proc_list_start, target_address, mm_address;
++	void *name, *path, *data;
++	struct vmipl_connect_info connect_info;
++	__u32 *event_pointer;
++	__u8 *field_pointer;
++	unsigned int *pid_pointer;
++	unsigned long *pgd_pointer;
++	unsigned int count;
++	
++	struct timespec before, after;
++		
++	do_posix_clock_monotonic_gettime(&before);
++	curr_head = vcpu->probe.os_settings.proc_list_address;
++//	printk("process head: %lu pid offset: %d fields: %d\n", curr_head, vcpu->probe.os_settings.pid_offset, process_list->fields);
++	proc_list_start = curr_head + vcpu->probe.os_settings.tasks_offset;
++	next = 0;
++	count = 0;
++	
++	connect_info.nl_socket = vcpu->probe.nl_socket;
++	
++	while (next != proc_list_start && count < 1000) {
++		total_size = 0;
++		
++		if (process_list->fields & VMI_PL_PROC_PID) {
++			total_size += sizeof(unsigned int);
++			target_address = curr_head + vcpu->probe.os_settings.pid_offset;
++			vmipl_read_memory(vcpu, target_address, (void*) &pid, sizeof(pid));
++		}
++		if (process_list->fields & VMI_PL_PROC_NAME) {
++			target_address = curr_head + vcpu->probe.os_settings.proc_name_offset;
++			name = vmipl_read_string_from_memory(vcpu, target_address, &name_size);
++			total_size += name_size;
++		}
++		if (process_list->fields & VMI_PL_PROC_PGD || process_list->fields & VMI_PL_PROC_PATH) {
++			target_address = curr_head + vcpu->probe.os_settings.mm_struct_offset;
++			vmipl_read_memory(vcpu, target_address, (void*) &mm_address, sizeof(mm_address));
++		}
++		if (process_list->fields & VMI_PL_PROC_PGD) {
++			total_size += sizeof(unsigned long);
++			if (mm_address != 0) {
++				target_address = mm_address + vcpu->probe.os_settings.pgd_offset;
++				vmipl_read_memory(vcpu, target_address, (void*) &pgd, sizeof(pgd));
++			} else {
++				pgd = 0;
++			}
++		}
++		if (process_list->fields & VMI_PL_PROC_PATH) {
++			if (mm_address != 0) {
++				path = vmipl_read_linux_path(vcpu, mm_address, &path_length);
++			} else {
++				path = "-";
++				path_length = 2;
++			}
++			total_size += path_length;
++		}
++		
++		//		probe_id		fields		 fields content
++		size = sizeof(__u32) + sizeof(__u8) + total_size;
++		
++		vmipl_prepare_sending(&connect_info, size);
++		data = (void*) nlmsg_data(connect_info.nlh);
++	
++		event_pointer = (__u32*) data;
++		*event_pointer = event_probe_id;
++		event_pointer++;
++		field_pointer = (__u8*) event_pointer;
++		*field_pointer = process_list->fields;
++		field_pointer++;
++		data = (void*) field_pointer;
++		
++		if (process_list->fields & VMI_PL_PROC_PID) {
++			pid_pointer = (unsigned int*) data;
++			*pid_pointer = pid;
++			pid_pointer++;
++			data = (void*) pid_pointer;
++		}
++		if (process_list->fields & VMI_PL_PROC_NAME) {
++			memcpy(data, name, name_size);
++			data += name_size;
++			kfree(name);
++		}
++		if (process_list->fields & VMI_PL_PROC_PGD) {
++			pgd_pointer = (unsigned long*) data;
++			*pgd_pointer = pgd;
++			pgd_pointer++;
++			data = (void*) pgd_pointer;
++		}
++		if (process_list->fields & VMI_PL_PROC_PATH) {
++			memcpy(data, path, path_length);
++			if (mm_address != 0) {
++				kfree(path);				
++			}
++		}
++		
++		vmipl_send(&connect_info, process_list->data_struct.group_id, VMI_PL_MSG_D_PROC_LIST);
++		
++		vmipl_read_memory(vcpu, curr_head + vcpu->probe.os_settings.tasks_offset, (void*) &next, sizeof(next));
++		curr_head = next - vcpu->probe.os_settings.tasks_offset;
++		count++;
++	}
++	
++	vmipl_prepare_sending(&connect_info, 0);
++	vmipl_send(&connect_info, process_list->data_struct.group_id, VMI_PL_MSG_D_PROC_LIST_END);
++	do_posix_clock_monotonic_gettime(&after);
++	printk("time to read out process list seconds: %lu nanoseconds: %lu count: %d\n", (unsigned long) after.tv_sec - before.tv_sec, (unsigned long) after.tv_nsec - before.tv_nsec, count);
++}
++
++/* helper functions */
++void vmipl_prepare_sending(struct vmipl_connect_info *connect_info, unsigned long size) {
++	connect_info->skb = nlmsg_new(size, GFP_USER);
++	connect_info->tmp = connect_info->skb->tail;
++	connect_info->nlh = nlmsg_put(connect_info->skb, 0, 0, 1, size, 0);
++}
++
++void vmipl_send(struct vmipl_connect_info *connect_info, __u32 group_id, __u16 msg_type) {
++	connect_info->nlh->nlmsg_len = connect_info->skb->tail - connect_info->tmp;
++	connect_info->nlh->nlmsg_type = msg_type;
++	NETLINK_CB(connect_info->skb).dst_group = group_id; 
++	
++	netlink_broadcast(connect_info->nl_socket, connect_info->skb, 0, group_id, GFP_USER);
++}
++		
++unsigned long vmipl_register_data_size(__u32 registers) {
++	unsigned long size; //, temp_size
++//	__u32 temp;
++	
++	size = 2 * sizeof(__u32); // event probe ID + register ID
++	
++/*	temp = registers & VMI_PL_REGISTERS;
++	temp_size = vmipl_number_of_set_bits(temp);
++	size += temp_size * sizeof(unsigned long);
++	
++	temp = registers & VMI_PL_SEGMENTS;
++	temp_size = vmipl_number_of_set_bits(temp);
++	size += temp_size * sizeof(struct vmipl_segment);
++	
++	temp = registers & VMI_PL_DTABLES;
++	temp_size = vmipl_number_of_set_bits(temp);
++	size += temp_size * sizeof(struct vmipl_dt);*/
++	
++	if (registers & VMI_PL_REGISTERS)
++		size += sizeof(unsigned long);
++	else if (registers & VMI_PL_SEGMENTS)
++		size += sizeof(struct vmipl_segment);
++	else if (registers & VMI_PL_DTABLES)
++		size += sizeof(struct vmipl_dt);
++		
++	return size;
++}
++
++unsigned int vmipl_number_of_set_bits(__u32 i) {
++    i = i - ((i >> 1) & 0x55555555);
++    i = (i & 0x33333333) + ((i >> 2) & 0x33333333);
++    return (((i + (i >> 4)) & 0x0F0F0F0F) * 0x01010101) >> 24;
++}
++
++unsigned char vmipl_process_filters(struct kvm_vcpu *vcpu, struct vmipl_event_struct *event) {
++	struct  vmipl_address_filter *addr_filter;
++	struct vmipl_register_filter *reg_filter;
++	unsigned char pause;
++	unsigned long mem_value;
++	
++	pause = 0;
++
++	if (event->active_filters & VMI_PL_REG_FILTER) {
++		reg_filter = event->register_filters;
++		while (reg_filter != NULL) {
++			if (vmipl_read_selected_register(vcpu, reg_filter->selected_register) == reg_filter->value) {
++				vmipl_process_data_probes(vcpu, event->probe_id, reg_filter->active_data_probes, reg_filter->data_probes_root);
++				pause |= reg_filter->pause;
++			}
++			reg_filter = reg_filter->next;
++		}
++	}
++	if (event->active_filters & VMI_PL_ADDR_FILTER) {
++		addr_filter = event->address_filters;
++		while (reg_filter != NULL) {
++			vmipl_read_memory(vcpu, addr_filter->virtual_address, (void*) &mem_value, sizeof(unsigned long));
++			if (mem_value == addr_filter->value) {
++				vmipl_process_data_probes(vcpu, event->probe_id, addr_filter->active_data_probes, addr_filter->data_probes_root);
++				pause |= addr_filter->pause;
++			}
++			addr_filter = addr_filter->next;
++		}
++	}
++	
++	return pause;
++}
++
++void vmipl_process_data_probes(struct kvm_vcpu *vcpu, __u32 event_probe_id, __u16 active_data_probes, struct vmipl_tree *root) {
++	struct vmipl_data_struct *data_probe;
++
++
++	if (active_data_probes & VMI_PL_READ_REG) {
++		data_probe = vmipl_get_tree_element(root, VMI_PL_READ_REG);
++		while (data_probe != NULL) {
++			vmipl_read_register_probe(vcpu, (struct vmipl_read_reg_struct*) data_probe, event_probe_id);
++			data_probe = data_probe->next;
++		}
++	}
++	if (active_data_probes & VMI_PL_READ_MEM) {
++		data_probe = vmipl_get_tree_element(root, VMI_PL_READ_MEM);
++		while (data_probe != NULL) {
++			vmipl_read_memory_probe(vcpu, (struct vmipl_read_mem_struct*) data_probe, event_probe_id);
++			data_probe = data_probe->next;
++		}
++	}
++	if (active_data_probes & VMI_PL_READ_MEM_AT) {
++		data_probe = vmipl_get_tree_element(root, VMI_PL_READ_MEM_AT);
++		while (data_probe != NULL) {
++			vmipl_read_memory_at_probe(vcpu, (struct vmipl_read_mem_at_struct*) data_probe, event_probe_id);
++			data_probe = data_probe->next;
++		}
++	}
++	if (active_data_probes & VMI_PL_PROC_LIST) {
++		data_probe = vmipl_get_tree_element(root, VMI_PL_PROC_LIST);
++		while (data_probe != NULL) {
++			vmipl_process_list_probe(vcpu, (struct vmipl_proc_list_struct*) data_probe, event_probe_id);
++			data_probe = data_probe->next;
++		}
++	}
++
++}
++
++unsigned long vmipl_read_selected_register(struct kvm_vcpu *vcpu, __u32 selected_register) {
++	unsigned long result;
++	struct kvm_segment segment;
++	struct desc_ptr dt;
++	
++	switch(selected_register) {
++		case VMI_PL_EAX:
++			result = kvm_register_read(vcpu, VCPU_REGS_RAX );
++			break;
++		case VMI_PL_EBX:
++			result = kvm_register_read(vcpu, VCPU_REGS_RBX );
++			break;
++		case VMI_PL_ECX:
++			result = kvm_register_read(vcpu, VCPU_REGS_RCX );
++			break;
++		case VMI_PL_EDX:
++			result = kvm_register_read(vcpu, VCPU_REGS_RDX );
++			break;
++		case VMI_PL_ESI:
++			result = kvm_register_read(vcpu, VCPU_REGS_RSI );
++			break;
++		case VMI_PL_EDI:
++			result = kvm_register_read(vcpu, VCPU_REGS_RDI );
++			break;
++		case VMI_PL_ESP:
++			result = kvm_register_read(vcpu, VCPU_REGS_RSP );
++			break;
++		case VMI_PL_EBP:
++			result = kvm_register_read(vcpu, VCPU_REGS_RBP );
++			break;
++		case VMI_PL_EIP:
++			result = kvm_register_read(vcpu, VCPU_REGS_RIP );
++			break;
++		case VMI_PL_EFLAGS:
++			result = vmx_get_rflags(vcpu);
++			break;
++		case VMI_PL_CR0:
++			result = (unsigned long) kvm_read_cr0(vcpu);
++			break;
++		case VMI_PL_CR2:
++			result = vcpu->arch.cr2;
++			break;
++		case VMI_PL_CR3:
++			result = (unsigned long) kvm_read_cr3(vcpu);
++			break;
++		case VMI_PL_CR4:
++			result = (unsigned long) kvm_read_cr4(vcpu);
++			break;
++		case VMI_PL_CS:
++			kvm_x86_ops->get_segment(vcpu, &segment, VCPU_SREG_CS);
++			result = (unsigned long) segment.base;
++			break;
++		case VMI_PL_SS:
++			kvm_x86_ops->get_segment(vcpu, &segment, VCPU_SREG_SS);
++			result = (unsigned long) segment.base;
++			break;
++		case VMI_PL_DS:
++			kvm_x86_ops->get_segment(vcpu, &segment, VCPU_SREG_DS);
++			result = (unsigned long) segment.base;
++			break;
++		case VMI_PL_ES:
++			kvm_x86_ops->get_segment(vcpu, &segment, VCPU_SREG_ES);
++			result = (unsigned long) segment.base;
++			break;
++		case VMI_PL_FS:
++			kvm_x86_ops->get_segment(vcpu, &segment, VCPU_SREG_FS);
++			result = (unsigned long) segment.base;
++			break;
++		case VMI_PL_GS:
++			kvm_x86_ops->get_segment(vcpu, &segment, VCPU_SREG_GS);
++			result = (unsigned long) segment.base;
++			break;
++		case VMI_PL_TR:
++			kvm_x86_ops->get_segment(vcpu, &segment, VCPU_SREG_TR);
++			result = (unsigned long) segment.base;
++			break;
++		case VMI_PL_LDTR:
++			kvm_x86_ops->get_segment(vcpu, &segment, VCPU_SREG_LDTR);
++			result = (unsigned long) segment.base;
++			break;
++		case VMI_PL_GDTR:
++			kvm_x86_ops->get_gdt(vcpu, &dt);
++			result = (unsigned long) dt.address;
++			break;
++		case VMI_PL_IDTR:
++			kvm_x86_ops->get_idt(vcpu, &dt);
++			result = (unsigned long) dt.address;
++			break;
++		default:
++			result = 0;
++			break;
++	}
++	return result;	
++}
++
++void vmipl_read_segment(struct kvm_vcpu *vcpu, struct vmipl_segment *segment, __u32 selected_segment) {
++	struct kvm_segment seg;
++	int seg_id;
++	
++	switch(selected_segment) {
++		case VMI_PL_CS:
++			seg_id = VCPU_SREG_CS;
++			break;
++		case VMI_PL_SS:
++			seg_id = VCPU_SREG_SS;
++			break;
++		case VMI_PL_DS:
++			seg_id = VCPU_SREG_DS;
++			break;
++		case VMI_PL_ES:
++			seg_id = VCPU_SREG_ES;
++			break;
++		case VMI_PL_FS:
++			seg_id = VCPU_SREG_FS;
++			break;
++		case VMI_PL_GS:	
++			seg_id = VCPU_SREG_GS;
++			break;
++		case VMI_PL_TR:
++			seg_id = VCPU_SREG_TR;
++			break;
++		case VMI_PL_LDTR:
++			seg_id = VCPU_SREG_LDTR;
++			break;
++		default:
++			seg_id = 0;
++			break;
++	}
++	
++	kvm_x86_ops->get_segment(vcpu, &seg, seg_id);
++	segment->base = (unsigned long) seg.base;
++	segment->limit = seg.limit;
++	segment->type = seg.type;
++	segment->present = seg.present;
++	segment->dpl = seg.dpl;
++	segment->db = seg.db;
++	segment->s = seg.s;
++	segment->l = seg.l;
++	segment->g = seg.g;
++	segment->avl = seg.avl;
++	
++}
++
++void vmipl_read_dt(struct kvm_vcpu *vcpu, struct vmipl_dt *dt, __u32 selected_dt) {
++	struct desc_ptr dtable;
++	
++	switch(selected_dt) {
++		case VMI_PL_GDTR:
++			kvm_x86_ops->get_gdt(vcpu, &dtable);
++			break;
++		case VMI_PL_IDTR:
++			kvm_x86_ops->get_idt(vcpu, &dtable);
++			break;
++		default:
++			break;
++	}
++	
++	dt->base = dtable.address;
++	dt->limit = dtable.size;
++	
++}
++
++void vmipl_read_memory(struct kvm_vcpu *vcpu, unsigned long va, void *buffer, int buffer_size) {
++	int idx;
++	unsigned long gpa;
++
++	idx = srcu_read_lock(&vcpu->kvm->srcu);
++	gpa = vcpu->arch.walk_mmu->gva_to_gpa(vcpu, va, 0, NULL);
++	srcu_read_unlock(&vcpu->kvm->srcu, idx);
++	kvm_read_guest(vcpu->kvm, gpa, buffer, buffer_size);
++
++}
++
++void* vmipl_read_string_from_memory(struct kvm_vcpu *vcpu, unsigned long va, int* size) {
++	int idx, tmp_size, i;
++	short buffer_size;
++	unsigned long gpa;
++	char *buffer, *tmp_buffer, *buffer_pointer;
++	char all_read;
++
++	buffer_size = 32;
++	all_read = 0;
++	tmp_size = 1;
++	buffer = (char*) kmalloc(sizeof(char) * buffer_size, GFP_KERNEL);
++	buffer_pointer = buffer;
++	
++	idx = srcu_read_lock(&vcpu->kvm->srcu);
++	gpa = vcpu->arch.walk_mmu->gva_to_gpa(vcpu, va, 0, NULL);
++	srcu_read_unlock(&vcpu->kvm->srcu, idx);
++	
++	while (!all_read && tmp_size < 100) {	// assumes that no string is read 
++											// with more than 100 characters to 
++		i = 0;								// prevent infinite loops
++	
++		kvm_read_guest(vcpu->kvm, gpa, buffer_pointer, buffer_size);
++		while (buffer_pointer[i] != '\0' && i < buffer_size) {
++			tmp_size++;
++			i++;
++		}
++		if (buffer_pointer[i] == '\0') {
++			all_read = 1;
++		} else {
++			gpa += buffer_size;
++			tmp_buffer = buffer;
++			buffer = (char*) kmalloc(tmp_size + sizeof(char) * buffer_size, GFP_KERNEL);
++			memcpy(buffer, tmp_buffer, tmp_size);
++			buffer_pointer = buffer + tmp_size;
++			kfree(tmp_buffer);
++		}
++	}
++	
++	*size = tmp_size;
++	return buffer;
++}
++
++void* vmipl_read_linux_path(struct kvm_vcpu *vcpu, unsigned long mm_address, unsigned int* path_length) {
++	
++	unsigned int path_size, tmp_path_size;
++	unsigned long target_address, tmp_address, parent_address, name_address;
++	void *path, *tmp_path, *buffer;
++	unsigned short count;
++	char *fix, *path_string;
++	
++	path = NULL;
++	path_size = 0;
++	count = 0;
++	
++	target_address = mm_address + vcpu->probe.os_settings.exe_file_offset;
++	vmipl_read_memory(vcpu, target_address, (void*) &tmp_address, sizeof(tmp_address));	// find file pointer
++	target_address = tmp_address + vcpu->probe.os_settings.dentry_offset;
++	vmipl_read_memory(vcpu, target_address, (void*) &tmp_address, sizeof(tmp_address));	// find path' dentry
++	target_address = tmp_address + vcpu->probe.os_settings.parent_offset;
++	vmipl_read_memory(vcpu, target_address, (void*) &parent_address, sizeof(parent_address)); // find parent address
++	
++	while (tmp_address != parent_address && count < 20) {		// stop reading path when root is reached (the parent of root is root)
++		target_address = tmp_address + vcpu->probe.os_settings.dname_offset;
++		vmipl_read_memory(vcpu, target_address, (void*) &name_address, sizeof(name_address));
++		buffer = vmipl_read_string_from_memory(vcpu, name_address, &tmp_path_size);
++//		printk("path part: %s\n", (char*) buffer);
++		if (path == NULL) {
++			path = buffer;
++		} else {
++			tmp_path = path;
++			path = kmalloc(path_size + tmp_path_size, GFP_KERNEL);
++			memcpy(path, buffer, tmp_path_size);
++			path_string = (char*) path;
++			path_string[tmp_path_size - 1] = '/';
++			memcpy(path + tmp_path_size, tmp_path, path_size);
++			kfree(tmp_path);
++		}
++		path_size += tmp_path_size;
++		tmp_address = parent_address;
++		target_address = tmp_address + vcpu->probe.os_settings.parent_offset;
++		vmipl_read_memory(vcpu, target_address, (void*) &parent_address, sizeof(parent_address)); // find parent address
++		count++;
++	}
++	
++	if (count == 20) {
++		fix = (char*) path;
++		fix[path_size - 1] = '\0';
++	}
++	*path_length = path_size;
++	return path;
++}
++
++void vmipl_write_to_address(struct kvm_vcpu *vcpu, unsigned long va, void *data, int data_size) {
++	int idx;
++	unsigned long gpa;
++
++	idx = srcu_read_lock(&vcpu->kvm->srcu);
++	gpa = vcpu->arch.walk_mmu->gva_to_gpa(vcpu, va, 0, NULL);
++	srcu_read_unlock(&vcpu->kvm->srcu, idx);
++	kvm_write_guest(vcpu->kvm, gpa, data, data_size);
++}
++
++void vmipl_set_dr7(struct vmipl_at_event_struct *at_event, unsigned long *dr7_content) {
++	switch(at_event->dbg_register) {
++		case VMI_PL_DBG_0:
++			*dr7_content |= VMI_PL_DBG_0_GLOBAL;
++			*dr7_content &= ~(VMI_PL_DBG_0_ON_WRITE | VMI_PL_DBG_0_ON_ACCESS);
++			switch(at_event->event_condition) {
++				case VMI_PL_READ:
++					*dr7_content |= VMI_PL_DBG_0_ON_ACCESS;
++					break;
++				case VMI_PL_WRITE:
++					*dr7_content |= VMI_PL_DBG_0_ON_WRITE;
++					break;
++				case VMI_PL_EXEC:
++					break;
++			}
++			break;
++		case VMI_PL_DBG_1:
++			*dr7_content |= VMI_PL_DBG_1_GLOBAL;
++			*dr7_content &= ~(VMI_PL_DBG_1_ON_WRITE | VMI_PL_DBG_1_ON_ACCESS);
++			switch(at_event->event_condition) {
++				case VMI_PL_READ:
++					*dr7_content |= VMI_PL_DBG_1_ON_ACCESS;
++					break;
++				case VMI_PL_WRITE:
++					*dr7_content |= VMI_PL_DBG_1_ON_WRITE;
++					break;
++				case VMI_PL_EXEC:
++					break;
++			}
++			break;
++		case VMI_PL_DBG_2:
++			*dr7_content |= VMI_PL_DBG_2_GLOBAL;
++			*dr7_content &= ~(VMI_PL_DBG_2_ON_WRITE | VMI_PL_DBG_2_ON_ACCESS);
++			switch(at_event->event_condition) {
++				case VMI_PL_READ:
++					*dr7_content |= VMI_PL_DBG_2_ON_ACCESS;
++					break;
++				case VMI_PL_WRITE:
++					*dr7_content |= VMI_PL_DBG_2_ON_WRITE;
++					break;
++				case VMI_PL_EXEC:
++					break;
++			}
++			break;
++		case VMI_PL_DBG_3:
++			*dr7_content |= VMI_PL_DBG_3_GLOBAL;
++			*dr7_content &= ~(VMI_PL_DBG_3_ON_WRITE | VMI_PL_DBG_3_ON_ACCESS);
++			switch(at_event->event_condition) {
++				case VMI_PL_READ:
++					*dr7_content |= VMI_PL_DBG_3_ON_ACCESS;
++					break;
++				case VMI_PL_WRITE:
++					*dr7_content |= VMI_PL_DBG_3_ON_WRITE;
++					break;
++				case VMI_PL_EXEC:
++					break;
++			}
++			break;
++	}
++}
++
++void vmipl_emulate_instructions(struct kvm_vcpu *vcpu) {
++	unsigned long rsp, rax, rip, flags;
++	/* implementation of push ax (opcode: 0x50) */
++	rsp = kvm_register_read(vcpu, VCPU_REGS_RSP);
++	rsp -= sizeof(rax);
++	rax = kvm_register_read(vcpu, VCPU_REGS_RAX);
++	vmipl_write_to_address(vcpu, rsp, &rax, sizeof(rax));
++	kvm_register_write(vcpu, VCPU_REGS_RSP, (u32) rsp);
++	
++	/* implementation of cld (opcode: 0xfc) */
++	flags = vmx_get_rflags(vcpu);
++	flags &= ~VMI_PL_DF;
++	kvm_set_rflags(vcpu, flags);
++	
++	/* skip the two emulated instructions */
++	rip = kvm_register_read(vcpu, VCPU_REGS_RIP);
++	rip += 2;
++	kvm_register_write(vcpu, VCPU_REGS_RIP, (u32) rip);
++}
++
++/* functions for tree handling */
++
++void vmipl_tree_insert(struct vmipl_tree **root, void *value, __u32 probe_type) {
++	char **value_pointer;
++	
++	if (*root == NULL) {
++		*root = (struct vmipl_tree*) kmalloc(sizeof(struct vmipl_tree), GFP_KERNEL);
++		(*root)->type = probe_type;
++		(*root)->left = NULL;
++		(*root)->right = NULL;
++		(*root)->value = value;
++	} else {
++		if ((*root)->type == probe_type) {
++			value_pointer = (char **) (*root)->value;
++			while (*value_pointer != NULL) {
++				value_pointer = (char**) *value_pointer;
++			}
++			*value_pointer = (char*) value; 
++		} else if ((*root)->type < probe_type) {
++			vmipl_tree_insert(&((*root)->left), value, probe_type);
++		} else {
++			vmipl_tree_insert(&((*root)->right), value, probe_type);
++		}
++	}
++	
++}
++
++void* vmipl_get_tree_element(struct vmipl_tree *root, __u32 type) {
++	
++	if (root->type == type) {
++		return root->value;
++	}
++	if (root->type < type) {
++		if (root->left != NULL) {
++			return vmipl_get_tree_element(root->left, type);
++		} else {
++			return NULL;
++		}
++	} else {
++		if (root->right != NULL) {
++			return vmipl_get_tree_element(root->right, type);
++		} else {
++			return NULL;
++		}
++	}
++}
++
++void vmipl_free_event_tree(struct vmipl_tree *root) {
++	struct vmipl_event_struct *event;
++	
++	if (root->left != NULL || root->right != NULL) {
++		if (root->left != NULL) {
++			vmipl_free_event_tree(root->left);
++		}
++		if (root->right != NULL) {
++			vmipl_free_event_tree(root->right);
++		}
++	} 
++	if (root->value != NULL) {
++		event = (struct vmipl_event_struct*) root->value;
++		if (event->data_probes_root != NULL) {
++			vmipl_free_data_probe_tree(event->data_probes_root);
++		}
++		vmipl_free_linked_list((char**) root->value);
++	}
++	kfree(root);
++}
++
++void vmipl_free_data_probe_tree(struct vmipl_tree *root) {
++	
++	if (root->left != NULL || root->right != NULL) {
++		if (root->left != NULL) {
++			vmipl_free_data_probe_tree(root->left);
++		}
++		if (root->right != NULL) {
++			vmipl_free_data_probe_tree(root->right);
++		}
++	}
++	if (root->value != NULL) {
++		vmipl_free_linked_list((char**) root->value);
++	}
++	kfree(root);
++}
++
++void vmipl_free_linked_list(char **next) {
++	char *element;
++	
++	if (*next != NULL) {
++		vmipl_free_linked_list((char**) *next);
++	} 
++	element = (char*) next;
++	kfree(element);
++}
++
++void vmipl_vcpu_list_add(struct vmipl_vcpu_list **list, struct kvm_vcpu *vcpu, unsigned char protocol_type) {
++	struct vmipl_vcpu_list **tmp_list, *new_entry;
++	
++	tmp_list = list;
++	while (*tmp_list != NULL) {
++		tmp_list = &((*tmp_list)->next);
++	}	
++	new_entry = (struct vmipl_vcpu_list*) kmalloc(sizeof(struct vmipl_vcpu_list), GFP_KERNEL);
++	new_entry->next = NULL;
++	new_entry->vcpu = vcpu;
++	new_entry->protocol_type = protocol_type;
++	*tmp_list = new_entry;
++}
++
++struct kvm_vcpu* vmipl_vcpu_list_get(struct vmipl_vcpu_list *list, unsigned char protocol_type) {
++	unsigned char found;
++	struct vmipl_vcpu_list *iterator;
++	struct kvm_vcpu* vcpu;
++	
++	found = 0;
++	iterator = list;
++	vcpu = NULL;
++	while (!found) {
++		if (iterator == NULL || iterator->protocol_type == protocol_type) {
++			found = 1;
++		} else {
++			iterator = iterator->next;
++		}
++	}	
++	if (iterator != NULL) {
++		vcpu = iterator->vcpu;
++	} 
++	
++	return vcpu;
++}
++
++unsigned char vmipl_vcpu_list_remove(struct vmipl_vcpu_list **list, struct kvm_vcpu *vcpu) {
++	struct vmipl_vcpu_list *curr, *prev;
++	unsigned char deleted;
++	
++	deleted = 0;
++	prev = *list;
++	if (prev == NULL) {
++		return deleted;
++	}
++	if (prev->vcpu == vcpu) {
++		*list = prev->next;
++		kfree(prev);
++		deleted = 1;
++	} else {
++		curr = prev->next;
++		while (curr != NULL && curr->vcpu != vcpu) {
++			prev = curr;
++			curr = curr->next;
++		}
++		if (curr != NULL) {
++			prev->next = curr->next;
++			kfree(curr);
++			deleted = 1;
++		}
++	}
++	
++	return deleted;
++}
++
++#endif	//VMI_PL
++
+ module_init(vmx_init)
+ module_exit(vmx_exit)

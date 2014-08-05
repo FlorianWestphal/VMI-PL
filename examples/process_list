@@ -1,0 +1,17 @@
+Configuration{
+	ProcessListHead: 0xc17cdfe0
+	TasksOffset: 440
+	PIDOffset: 520
+	ProcessNameOffset: 744
+	MMStructOffset: 468
+	ExeFileOffset: 444
+	DEntryOffset: 12
+	ParentOffset: 16
+	DNameOffset: 28
+	PGDOffset: 40
+	SyscallNumberLocation: EAX
+	SyscallInterruptNumber: 128
+}
+ExecuteAt(0xc104f060){
+	ProcessList(PID, NAME, PATH, PGDP, #test)
+}
